@@ -24,6 +24,7 @@ mod execution;
 mod repl;
 mod statement;
 mod table;
+mod tree;
 
 fn global_table() -> &'static Mutex<table::Table> {
     static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
