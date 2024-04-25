@@ -63,7 +63,7 @@ impl Pager {
         ))?;
         self.pages += 1;
         let page = vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
-        self.cache[index] = Some(Page::Leaf(LeafNode::new(page)));
+        self.cache[index] = Some(Page::Leaf(LeafNode::new_with_bytes(page)));
         let Page::Leaf(page) = self.cache[index].as_mut().unwrap() else {
             unreachable!()
         };
@@ -81,7 +81,7 @@ impl Pager {
                     vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
                 self.file.read_exact(&mut *page)?;
                 let page = match page[0] {
-                    0 => Page::Leaf(LeafNode::new(page)),
+                    0 => Page::Leaf(LeafNode::new_with_bytes(page)),
                     1 => Page::Intermediate(InternalNode::new(page)),
                     _ => unreachable!(),
                 };

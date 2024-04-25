@@ -29,11 +29,17 @@ impl LeafNode {
     const NUM_CELLS_OFFSET: usize = COMMON_NODE_HEADER_SIZE;
     const NEXT_LEAF_SIZE: usize = mem::size_of::<u32>();
     const NEXT_LEAF_OFFSET: usize = Self::NUM_CELLS_OFFSET + Self::NUM_CELLS_SIZE;
-    const HEADER_SIZE: usize = Self::NEXT_LEAF_SIZE + Self::NEXT_LEAF_SIZE;
+    const HEADER_SIZE: usize = Self::NEXT_LEAF_OFFSET + Self::NEXT_LEAF_SIZE;
     const KEY_SIZE: usize = mem::size_of::<u32>();
     const SPACE_FOR_CELLS: usize = 4096 - Self::HEADER_SIZE;
 
-    pub fn new(bytes: Box<[u8; 4096]>) -> Self {
+    pub fn new() -> Self {
+        Self {
+            bytes: vec![0u8; 4096].into_boxed_slice().try_into().unwrap(),
+        }
+    }
+
+    pub fn new_with_bytes(bytes: Box<[u8; 4096]>) -> Self {
         Self { bytes }
     }
 
@@ -187,9 +193,8 @@ impl LeafNode {
         &mut self,
         key: u32,
         values: Vec<ScalarValue>,
-        pager: &'a mut Pager,
         schema: &Schema,
-    ) -> Option<&'a mut LeafNode> {
+    ) -> Option<LeafNode> {
         let value_size = schema.row_size();
         let max_cells = self.max_cells(value_size);
         let index = match self.binary_search(key, value_size) {
@@ -197,20 +202,21 @@ impl LeafNode {
             None => 0,
         };
 
-        if self.num_cells() < max_cells as u32 {
+        let num_cells = self.num_cells();
+        if num_cells < max_cells as u32 {
             for i in (index..self.num_cells() as usize).rev() {
                 self.copy_within(value_size, i, i + 1);
             }
             self.serialize_row(index, schema, key, &values);
-            self.set_num_cells(self.num_cells() + 1);
+            self.set_num_cells(num_cells + 1);
             return None;
         }
 
-        let (page_index, new_node) = pager.new_leaf_page().unwrap();
+        let mut new_node = LeafNode::new();
         new_node.set_parent(self.parent());
         new_node.set_next_leaf(self.next_leaf());
-        self.set_next_leaf(page_index as u32);
-        self.set_num_cells(self.num_cells() + 1);
+        // todo move this outside
+        //self.set_next_leaf(page_index as u32);
         let leaf_node_right_split_count: usize = (max_cells + 1) / 2;
         let leaf_node_left_split_count = (max_cells + 1) - leaf_node_right_split_count;
 
@@ -245,6 +251,9 @@ impl LeafNode {
                     .copy_from_slice(self.cell(i, value_size));
             }
         }
+
+        self.set_num_cells(leaf_node_left_split_count as u32);
+        new_node.set_num_cells(leaf_node_right_split_count as u32);
 
         Some(new_node)
     }
@@ -374,22 +383,12 @@ mod test {
 
     #[test]
     fn insert_one() {
-        let file = temp_dir().join("tmp.db");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(file)
-            .unwrap();
-
-        let mut pager = Pager::new(file, 0).unwrap();
         let schema = Schema {
             feilds: vec![("a".to_string(), DataType::Number)],
         };
-        let bytes = vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
-        let mut page = LeafNode::new(bytes);
+        let mut page = LeafNode::new();
         assert_eq!(page.num_cells(), 0);
-        page.leaf_node_split_and_insert(0, vec![ScalarValue::Number(1)], &mut pager, &schema);
+        page.leaf_node_split_and_insert(0, vec![ScalarValue::Number(1)], &schema);
         assert_eq!(page.num_cells(), 1);
         let (_, val) = page.read_row(0, &schema);
         assert_eq!(val, vec![ScalarValue::Number(1)])
@@ -397,27 +396,49 @@ mod test {
 
     #[test]
     fn insert_two() {
-        let file = temp_dir().join("tmp.db");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(file)
-            .unwrap();
-
-        let mut pager = Pager::new(file, 0).unwrap();
         let schema = Schema {
             feilds: vec![("a".to_string(), DataType::Number)],
         };
-        let bytes = vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
-        let mut page = LeafNode::new(bytes);
+        let mut page = LeafNode::new();
         assert_eq!(page.num_cells(), 0);
-        page.leaf_node_split_and_insert(1, vec![ScalarValue::Number(1)], &mut pager, &schema);
-        page.leaf_node_split_and_insert(0, vec![ScalarValue::Number(2)], &mut pager, &schema);
+        page.leaf_node_split_and_insert(1, vec![ScalarValue::Number(1)], &schema);
+        page.leaf_node_split_and_insert(0, vec![ScalarValue::Number(2)], &schema);
         assert_eq!(page.num_cells(), 2);
         let (_, val) = page.read_row(0, &schema);
         assert_eq!(val, vec![ScalarValue::Number(2)]);
         let (_, val) = page.read_row(1, &schema);
         assert_eq!(val, vec![ScalarValue::Number(1)]);
+    }
+
+    #[test]
+    fn fill_and_split() {
+        let schema = Schema {
+            feilds: vec![("a".to_string(), DataType::Number)],
+        };
+        let mut page = LeafNode::new();
+        assert_eq!(page.num_cells(), 0);
+        let value_size = schema.row_size();
+        let max_cell = page.max_cells(value_size);
+
+        for key in (0..max_cell).rev() {
+            page.leaf_node_split_and_insert(
+                key as u32,
+                vec![ScalarValue::Number(key as i64)],
+                &schema,
+            );
+            assert!(page.binary_search(key as u32, value_size).is_some());
+            assert_eq!(page.num_cells(), (max_cell - key) as u32);
+        }
+
+        let new_node = page
+            .leaf_node_split_and_insert(
+                max_cell as u32,
+                vec![ScalarValue::Number(max_cell as i64)],
+                &schema,
+            )
+            .unwrap();
+
+        assert_eq!(new_node.num_cells(), (max_cell as u32 + 1) / 2);
+        assert_eq!(new_node.parent(), page.parent());
     }
 }
