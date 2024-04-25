@@ -6,22 +6,45 @@ use std::{
 };
 
 use crate::{
-    datatype::{DataType, ScalarValue, Schema},
+    datatype::Schema,
     errors::Error,
     statement::InsertStatement,
+    tree::{InternalNode, LeafNode},
     TABLE_MAX_PAGE,
 };
+
+#[derive(Debug)]
+pub enum Page {
+    Leaf(LeafNode),
+    Intermediate(InternalNode),
+}
+
+impl Page {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Page::Leaf(x) => &*x.bytes,
+            Page::Intermediate(x) => &*x.bytes,
+        }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Page::Leaf(x) => &mut *x.bytes,
+            Page::Intermediate(x) => &mut *x.bytes,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Pager {
     file: File,
     pages: usize,
-    cache: [Option<Box<Page>>; TABLE_MAX_PAGE],
+    cache: [Option<Page>; TABLE_MAX_PAGE],
 }
 
 const HEADER_SPACE: usize = 4096;
 
-const NONE_VALUE: Option<Box<Page>> = None;
+const NONE_VALUE: Option<Page> = None;
 impl Pager {
     pub fn new(file: File, pages: u64) -> Result<Self, io::Error> {
         Ok(Self {
@@ -31,28 +54,39 @@ impl Pager {
         })
     }
 
-    pub fn page(&mut self, index: usize) -> Result<&mut Page, io::Error> {
-        if index >= self.pages {
-            self.file
-                .set_len((self.pages + 1) as u64 * 4096 + HEADER_SPACE as u64)?;
-            self.file.seek(std::io::SeekFrom::Start(
-                index as u64 * 4096 + HEADER_SPACE as u64,
-            ))?;
-            self.pages += 1;
-            self.cache[index] = Some(Box::new(Page::new()));
-            return Ok(unsafe { (&mut self.cache[index]).as_deref_mut().unwrap_unchecked() });
-        }
+    pub fn new_leaf_page(&mut self) -> Result<(u32, &mut LeafNode), io::Error> {
+        let index = self.pages;
+        self.file
+            .set_len((self.pages + 1) as u64 * 4096 + HEADER_SPACE as u64)?;
+        self.file.seek(std::io::SeekFrom::Start(
+            index as u64 * 4096 + HEADER_SPACE as u64,
+        ))?;
+        self.pages += 1;
+        let page = vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
+        self.cache[index] = Some(Page::Leaf(LeafNode::new(page)));
+        let Page::Leaf(page) = self.cache[index].as_mut().unwrap() else {
+            unreachable!()
+        };
+        return Ok((index as u32, page));
+    }
 
+    pub fn page(&mut self, index: usize) -> Result<&mut Page, io::Error> {
         match self.cache[index] {
             Some(ref mut page) => Ok(&mut *page),
             None => {
                 self.file.seek(std::io::SeekFrom::Start(
                     index as u64 * 4096 + HEADER_SPACE as u64,
                 ))?;
-                let mut page = Page { bytes: [0u8; 4096] };
-                self.file.read_exact(&mut page.bytes)?;
-                self.cache[index] = Some(Box::new(page));
-                Ok(unsafe { (&mut self.cache[index]).as_deref_mut().unwrap_unchecked() })
+                let mut page: Box<[u8; 4096]> =
+                    vec![0u8; 4096].into_boxed_slice().try_into().unwrap();
+                self.file.read_exact(&mut *page)?;
+                let page = match page[0] {
+                    0 => Page::Leaf(LeafNode::new(page)),
+                    1 => Page::Intermediate(InternalNode::new(page)),
+                    _ => unreachable!(),
+                };
+                self.cache[index] = Some(page);
+                Ok(unsafe { (&mut self.cache[index]).as_mut().unwrap_unchecked() })
             }
         }
     }
@@ -63,77 +97,11 @@ impl Pager {
                 self.file.seek(io::SeekFrom::Start(
                     index as u64 * 4096 + HEADER_SPACE as u64,
                 ))?;
-                self.file.write_all(&page.bytes)?;
+                self.file.write_all(page.bytes())?;
             }
             None => (),
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Page {
-    bytes: [u8; 4096],
-}
-
-impl Page {
-    pub fn new() -> Page {
-        Self { bytes: [0u8; 4096] }
-    }
-
-    pub fn read_row(&self, index: usize, schema: &Schema) -> Vec<ScalarValue> {
-        let mut offset = index * schema.row_size();
-        let mut values = Vec::new();
-        for (_, ty) in &schema.feilds {
-            let value = match ty {
-                DataType::String(size) => {
-                    let len = self.bytes[offset];
-                    if len != 0 {
-                        let bytes = &self.bytes[(offset + 1)..(offset + len as usize + 1)];
-                        offset += size;
-                        let string = String::from_utf8(bytes.to_owned()).unwrap();
-                        ScalarValue::String(string)
-                    } else {
-                        ScalarValue::String("".to_string())
-                    }
-                }
-                DataType::Number => {
-                    let bytes = &self.bytes[offset..offset + 8];
-                    offset += 8;
-                    ScalarValue::Number(i64::from_ne_bytes(bytes.try_into().unwrap()))
-                }
-            };
-            values.push(value);
-        }
-        values
-    }
-
-    pub fn write_row(&mut self, index: usize, schema: &Schema, values: Vec<ScalarValue>) {
-        let mut page_offset = index * schema.row_size();
-        let mut values = values.into_iter();
-
-        for (_, ty) in &schema.feilds {
-            match ty {
-                DataType::String(size) => {
-                    let ScalarValue::String(value) = values.next().unwrap() else {
-                        panic!()
-                    };
-                    let bytes = &mut self.bytes[page_offset..page_offset + size];
-                    bytes[0] = value.len() as u8;
-                    (&mut bytes[1..]).write(value.as_bytes()).unwrap();
-                    page_offset += size
-                }
-                DataType::Number => {
-                    let ScalarValue::Number(value) = values.next().unwrap() else {
-                        panic!()
-                    };
-                    (&mut self.bytes[page_offset..])
-                        .write(&value.to_ne_bytes())
-                        .unwrap();
-                    page_offset += 8
-                }
-            };
-        }
     }
 }
 
@@ -189,16 +157,17 @@ impl Table {
         })
     }
 
-    pub fn insert(&mut self, values: InsertStatement) -> Result<(), Error> {
+    pub fn insert(&mut self, _values: InsertStatement) -> Result<(), Error> {
         let num_rows = self.header.num_rows;
 
         if num_rows >= self.max_rows() {
             return Err(Error::RowLimit);
         }
+
         let row_per_page = self.rows_per_page();
         let page_index = (num_rows + 1) / row_per_page;
         let page = self.pages.page(page_index)?;
-        page.write_row(num_rows % row_per_page, &self.header.schema, values.values);
+        todo!("insert value");
         self.pages.flush_page(page_index)?;
         self.header.num_rows += 1;
         self.flush_table_header()?;
@@ -210,15 +179,14 @@ impl Table {
         let page_index = (self.header.num_rows + 1) / self.rows_per_page();
         let index = index % self.rows_per_page();
         let page = self.pages.page(page_index)?;
-        let values = page.read_row(index, &self.header.schema);
-
-        println!(
-            "{}",
-            values
-                .iter()
-                .map(|x| format!(" {} ", x))
-                .collect::<String>()
-        );
+        todo!("read row");
+        // println!(
+        //     "{}",
+        //     values
+        //         .iter()
+        //         .map(|x| format!(" {} ", x))
+        //         .collect::<String>()
+        // );
 
         Ok(())
     }
@@ -252,38 +220,7 @@ mod tests {
         io::Write,
     };
 
-    use crate::{
-        datatype::{DataType, ScalarValue, Schema},
-        PAGE_SIZE,
-    };
-
-    use super::{Page, Pager, HEADER_SPACE};
-
-    #[test]
-    fn read_scalar_from_page() {
-        let mut page = Page {
-            bytes: [0u8; PAGE_SIZE],
-        };
-
-        let schema = Schema {
-            feilds: vec![
-                ("a".to_string(), DataType::Number),
-                ("b".to_string(), DataType::String(10)),
-            ],
-        };
-
-        let input = vec![
-            ScalarValue::Number(1),
-            ScalarValue::String("hello".to_string()),
-        ];
-
-        page.write_row(0, &schema, input.clone());
-
-        let row = page.read_row(0, &schema);
-        let mut values = row.into_iter();
-        assert_eq!(values.next().unwrap(), input[0]);
-        assert_eq!(values.next().unwrap(), input[1]);
-    }
+    use super::{Pager, HEADER_SPACE};
 
     #[test]
     fn pager_test() {
@@ -297,18 +234,18 @@ mod tests {
 
         file.set_len(HEADER_SPACE as u64).unwrap();
         let mut pager = Pager::new(file.try_clone().unwrap(), 0).unwrap();
-        let page = pager.page(0).unwrap();
-        (&mut page.bytes).fill_with(|| 1u8);
-        let page = pager.page(1).unwrap();
-        (&mut page.bytes).fill_with(|| 2u8);
+        let (_, page) = pager.new_leaf_page().unwrap();
+        (&mut *page.bytes).fill_with(|| 1u8);
+        let (_, page) = pager.new_leaf_page().unwrap();
+        (&mut *page.bytes).fill_with(|| 2u8);
         pager.flush_page(0).unwrap();
         pager.flush_page(1).unwrap();
         pager.file.flush().unwrap();
 
         drop(pager);
         let mut pager = Pager::new(file, 2).unwrap();
-        assert_eq!(&pager.page(0).unwrap().bytes, vec![1u8; 4096].as_slice());
-        assert_eq!(&pager.page(1).unwrap().bytes, vec![2u8; 4096].as_slice());
+        assert_eq!(pager.page(0).unwrap().bytes(), vec![1u8; 4096].as_slice());
+        assert_eq!(pager.page(1).unwrap().bytes(), vec![2u8; 4096].as_slice());
 
         fs::remove_file(path).unwrap();
     }
